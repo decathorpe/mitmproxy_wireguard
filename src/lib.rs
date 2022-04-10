@@ -325,6 +325,7 @@ fn start_server(py: Python<'_>, host: String, port: u16, event_handler: PyObject
 #[pymodule]
 fn mitmproxy_wireguard(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
+    m.add_class::<ServerConnection>()?;
     m.add_class::<ConnectionEstablished>()?;
     m.add_class::<DataReceived>()?;
     m.add_class::<ConnectionClosed>()?;

@@ -40,3 +40,15 @@ $ tokio-console http://localhost:6669
 There should be no task that is busy when the program is idle, i.e. there
 should be no busy waiting.
 
+## Python stuffs
+
+To set up a virtual environment, maturin, compile the Python extension, and
+launch the `test.py` script, do the following:
+
+```bash
+python3 -m venv venv
+source ./venv/bin/activate
+pip install maturin
+maturin develop
+python3 ./test.py
+```

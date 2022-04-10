@@ -22,9 +22,14 @@ class DatagramReceived:
     data: bytes
 
 
+class ServerConnection:
+    def send(self, connection_id: int, data: bytes): ...
+    def close(self, connection_id: int): ...
+
+
 async def start_server(
     host: str,
     port: int,
     on_event: Callable[ConnectionEstablished | DataReceived | ConnectionClosed | DatagramReceived]
-):
+) -> ServerConnection:
     ...
