@@ -15,9 +15,13 @@ struct EchoHandler {}
 
 #[async_trait::async_trait]
 impl ConnectionHandler for EchoHandler {
-    async fn handle(&self, mut connection: TcpConnection) {
-        while let Some(data) = connection.read().await {
-            connection.write(data).await;
+    async fn handle(&self, connection: TcpConnection) {
+        let socket = connection.socket;
+        let mut reader = connection.conn_forw_recv;
+        let writer = connection.conn_back_send;
+
+        while let Some(data) = reader.recv().await {
+            writer.send((socket, data)).await.unwrap();
         }
     }
 }

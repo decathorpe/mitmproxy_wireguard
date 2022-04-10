@@ -1,20 +1,25 @@
-use std::collections::VecDeque;
-use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-
-use smoltcp::iface::SocketHandle;
-
 mod tcp;
 mod wg;
 
-use tcp::{ConnectionHandler, TcpConnection};
+use std::collections::{HashMap, VecDeque};
+use std::fmt::{Display, Formatter};
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use boringtun::crypto::{X25519PublicKey, X25519SecretKey};
+use pyo3::prelude::*;
+use tokio::sync::mpsc;
+
+use crate::tcp::{ConnectionHandler, TcpConnection};
+use crate::wg::WgServer;
+
+type ConnectionId = u32;
+type SendQueue = Arc<RwLock<VecDeque<Vec<u8>>>>;
 
 #[derive(Debug)]
 struct EventAdapter {
-    send_queue: Arc<RwLock<VecDeque<(SocketHandle, Vec<u8>)>>>,
-    send_ready: Arc<RwLock<bool>>,
+    send_queues: Arc<RwLock<HashMap<ConnectionId, SendQueue>>>,
     event_push: mpsc::Sender<Events>,
     sock_count: Arc<RwLock<u32>>,
     reuse_sock: Arc<RwLock<Vec<u32>>>,
@@ -23,34 +28,30 @@ struct EventAdapter {
 impl EventAdapter {
     fn new(event_push: mpsc::Sender<Events>) -> Self {
         EventAdapter {
-            send_queue: Default::default(),
-            send_ready: Arc::new(RwLock::new(false)),
+            send_queues: Default::default(),
             event_push,
             sock_count: Default::default(),
             reuse_sock: Default::default(),
         }
     }
 
-    fn send(&self, connection: SocketHandle, data: Vec<u8>) {
-        self.send_queue.write().unwrap().push_back((connection, data));
-        // FIXME: use a custom waker?
-        *self.send_ready.write().unwrap() = true;
+    fn send_queues(&self) -> Arc<RwLock<HashMap<ConnectionId, SendQueue>>> {
+        self.send_queues.clone()
     }
 
     async fn ready(&self) {
-        if *self.send_ready.read().unwrap() {
-            std::future::ready(()).await
-        } else {
-            // FIXME: use a custom waker?
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        // FIXME: use a custom waker?
+        tokio::time::sleep(Duration::from_millis(1000)).await;
     }
 }
 
 #[async_trait::async_trait]
 impl ConnectionHandler for EventAdapter {
     async fn handle(&self, connection: TcpConnection) {
-        let reader = connection.conn_forw_recv;
+        let socket = connection.socket;
+        let src_addr = connection.src_addr;
+        let dst_addr = connection.dst_addr;
+        let mut reader = connection.conn_forw_recv;
         let writer = connection.conn_back_send;
 
         let connection_id: u32 = {
@@ -63,11 +64,18 @@ impl ConnectionHandler for EventAdapter {
             }
         };
 
+        // initialize and register send queue for this connection
+        let send_queue = SendQueue::default();
+        self.send_queues
+            .write()
+            .unwrap()
+            .insert(connection_id, send_queue.clone());
+
         self.event_push
             .send(Events::ConnectionEstablished(ConnectionEstablished {
                 connection_id,
-                src_addr: todo!(),
-                dst_addr: todo!(),
+                src_addr: PySockAddr(src_addr),
+                dst_addr: PySockAddr(dst_addr),
             }))
             .await
             .unwrap();
@@ -91,24 +99,19 @@ impl ConnectionHandler for EventAdapter {
                     }
                 },
                 _ = self.ready() => {
-                    let mut queue = *self.send_queue.write().unwrap();
-
-                    while let Some((connection_id, data)) = queue.pop_front() {
-                        writer.send((connection_id, data)).await.unwrap();
+                    loop {
+                        let result = send_queue.write().unwrap().pop_front();
+                        if let Some(data) = result {
+                            writer.send((socket, data)).await.unwrap();
+                        } else {
+                            break;
+                        }
                     }
                 }
             )
         }
     }
 }
-
-// =============================================================================
-
-use pyo3::prelude::*;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-
-type ConnectionId = u32;
 
 #[derive(Clone, Debug)]
 struct PySockAddr(SocketAddr);
@@ -185,6 +188,7 @@ impl ConnectionClosed {
     }
 }
 
+/*
 #[pyclass]
 #[derive(Debug)]
 struct DatagramReceived {
@@ -205,13 +209,14 @@ impl DatagramReceived {
         )
     }
 }
+*/
 
 #[derive(Debug)]
 enum Events {
     ConnectionEstablished(ConnectionEstablished),
     DataReceived(DataReceived),
     ConnectionClosed(ConnectionClosed),
-    DatagramReceived(DatagramReceived),
+    //DatagramReceived(DatagramReceived),
 }
 
 impl IntoPy<PyObject> for Events {
@@ -220,94 +225,100 @@ impl IntoPy<PyObject> for Events {
             Events::ConnectionEstablished(e) => e.into_py(py),
             Events::DataReceived(e) => e.into_py(py),
             Events::ConnectionClosed(e) => e.into_py(py),
-            Events::DatagramReceived(e) => e.into_py(py),
+            //Events::DatagramReceived(e) => e.into_py(py),
         }
     }
 }
 
 #[pyclass]
-struct WireguardServer {
-    python_callback_task: JoinHandle<()>,
+struct ServerConnection {
+    send_queues: Arc<RwLock<HashMap<ConnectionId, SendQueue>>>,
 }
 
 #[pymethods]
-impl WireguardServer {
-    fn tcp_send(&self, connection_id: ConnectionId, data: Vec<u8>) -> PyResult<()> {
-        todo!()
-    }
-
-    fn tcp_close(&self, connection_id: ConnectionId) -> PyResult<()> {
-        todo!()
-    }
-
-    fn stop(&self) -> PyResult<()> {
-        self._stop();
+impl ServerConnection {
+    fn send(&self, connection_id: ConnectionId, data: Vec<u8>) -> PyResult<()> {
+        let queues = self.send_queues.write().unwrap();
+        let inner = queues.get(&connection_id).unwrap();
+        let queue = &mut *inner.write().unwrap();
+        queue.push_back(data);
         Ok(())
+    }
+
+    fn close(&self, _connection_id: ConnectionId) -> PyResult<()> {
+        todo!()
     }
 }
 
+struct WireguardServer {
+    server: WgServer,
+    event_receiver: mpsc::Receiver<Events>,
+    send_queues: Arc<RwLock<HashMap<ConnectionId, SendQueue>>>,
+}
+
 impl WireguardServer {
-    pub fn new(on_event: PyObject) -> WireguardServer {
-        let (tx, mut rx) = mpsc::channel::<Events>(64);
+    fn new(host: String, port: u16) -> WireguardServer {
+        // TODO: make configurable
+        let server_priv_key: X25519SecretKey = "c72d788fd0916b1185177fd7fa392451192773c889d17ac739571a63482c18bb"
+            .parse()
+            .unwrap();
 
-        // random sender for testing.
+        // TODO: make configurable
+        let peer_pub_key: X25519PublicKey = "DbwqnNYZWk5e19uuSR6WomO7VPaVbk/uKhmyFEnXdH8=".parse().unwrap();
+
+        let server_addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
+
+        let (tx, rx) = mpsc::channel::<Events>(64);
+
+        let eventer = EventAdapter::new(tx);
+        let send_queues = eventer.send_queues();
+
+        let mut server = WgServer::new(server_addr, server_priv_key, Box::new(eventer));
+
+        // TODO: make configurable
+        server.add_peer(Arc::new(peer_pub_key), None).unwrap();
+
+        WireguardServer {
+            server,
+            event_receiver: rx,
+            send_queues,
+        }
+    }
+
+    fn connection(&self) -> ServerConnection {
+        ServerConnection {
+            send_queues: self.send_queues.clone(),
+        }
+    }
+
+    fn _stop(&self) {
+        //self.python_callback_task.abort();
+        // TODO: this is not completely trivial. we should probably close all connections somehow.
+        //       does smoltcp do something for us here?
+    }
+}
+
+#[pyfunction]
+fn start_server(py: Python<'_>, host: String, port: u16, event_handler: PyObject) -> PyResult<&PyAny> {
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let mut server = WireguardServer::new(host, port);
+
+        let connection = server.connection();
+
+        // spawn Python event handler
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                tx.send(Events::ConnectionEstablished(ConnectionEstablished {
-                    connection_id: 42,
-                    src_addr: PySockAddr(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4242)),
-                    dst_addr: PySockAddr(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80)),
-                }))
-                .await
-                .unwrap();
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                tx.send(Events::DataReceived(DataReceived {
-                    connection_id: 42,
-                    data: vec![0, 1, 2],
-                }))
-                .await
-                .unwrap();
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                tx.send(Events::ConnectionClosed(ConnectionClosed { connection_id: 42 }))
-                    .await
-                    .unwrap();
-            }
-        });
-
-        // this task feeds events into the Python callback.
-        let call_python_callback = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
+            while let Some(event) = server.event_receiver.recv().await {
                 Python::with_gil(|py| {
-                    if let Err(err) = on_event.call1(py, (event,)) {
+                    if let Err(err) = event_handler.call1(py, (event,)) {
                         err.print(py);
                     }
                 });
             }
         });
 
-        WireguardServer {
-            python_callback_task: call_python_callback,
-        }
-    }
-    fn _stop(&self) {
-        self.python_callback_task.abort();
-        // TODO: this is not completely trivial. we should probably close all connections somehow.
-        //       does smoltcp do something for us here?
-    }
-}
-
-impl Drop for WireguardServer {
-    fn drop(&mut self) {
-        self._stop();
-    }
-}
-
-#[pyfunction]
-fn start_server(py: Python<'_>, host: String, port: u16, on_event: PyObject) -> PyResult<&PyAny> {
-    pyo3_asyncio::tokio::future_into_py(py, async move {
-        let server = WireguardServer::new(on_event);
-        Ok(server)
+        // spawn WireGuard server
+        tokio::spawn(server.server.serve());
+        Ok(connection)
     })
 }
 
@@ -317,6 +328,6 @@ fn mitmproxy_wireguard(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ConnectionEstablished>()?;
     m.add_class::<DataReceived>()?;
     m.add_class::<ConnectionClosed>()?;
-    m.add_class::<DatagramReceived>()?;
+    //m.add_class::<DatagramReceived>()?;
     Ok(())
 }

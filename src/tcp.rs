@@ -51,7 +51,9 @@ impl IpPacket {
 }
 
 pub struct TcpConnection {
-    socket: SocketHandle,
+    pub socket: SocketHandle,
+    pub src_addr: SocketAddr,
+    pub dst_addr: SocketAddr,
     pub conn_back_send: mpsc::Sender<(SocketHandle, Vec<u8>)>,
     pub conn_forw_recv: mpsc::Receiver<Vec<u8>>,
 }
@@ -59,22 +61,18 @@ pub struct TcpConnection {
 impl TcpConnection {
     fn new(
         socket: SocketHandle,
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
         conn_back_send: mpsc::Sender<(SocketHandle, Vec<u8>)>,
         conn_forw_recv: mpsc::Receiver<Vec<u8>>,
     ) -> TcpConnection {
         TcpConnection {
             socket,
+            src_addr,
+            dst_addr,
             conn_back_send,
             conn_forw_recv,
         }
-    }
-
-    pub async fn read(&mut self) -> Option<Vec<u8>> {
-        self.conn_forw_recv.recv().await
-    }
-
-    pub async fn write(&mut self, data: Vec<u8>) {
-        self.conn_back_send.send((self.socket, data)).await.unwrap()
     }
 }
 
@@ -183,6 +181,7 @@ impl PacketHandler {
         log::debug!("Outgoing IPv4 TCP packet: {} -> {}", src_ip, dst_ip);
         log::debug!("{}", pretty_hex(&ip_packet.payload_mut()));
 
+        let src_addr = SocketAddr::new(src_ip, tcp_packet.dst_port());
         let dst_addr = SocketAddr::new(dst_ip, tcp_packet.dst_port());
 
         let syn = tcp_packet.syn();
@@ -204,7 +203,8 @@ impl PacketHandler {
             // create connections with read / write streams for each new socket
             let (conn_forw_send, conn_forw_recv) = mpsc::channel(64);
 
-            let connection = TcpConnection::new(handle, self.conn_back_send.clone(), conn_forw_recv);
+            let connection =
+                TcpConnection::new(handle, src_addr, dst_addr, self.conn_back_send.clone(), conn_forw_recv);
 
             // spawn connection handler
             let conn_handler = self.conn_handler.clone();
