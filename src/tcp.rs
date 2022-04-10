@@ -52,8 +52,8 @@ impl IpPacket {
 
 pub struct TcpConnection {
     socket: SocketHandle,
-    conn_back_send: mpsc::Sender<(SocketHandle, Vec<u8>)>,
-    conn_forw_recv: mpsc::Receiver<Vec<u8>>,
+    pub conn_back_send: mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    pub conn_forw_recv: mpsc::Receiver<Vec<u8>>,
 }
 
 impl TcpConnection {

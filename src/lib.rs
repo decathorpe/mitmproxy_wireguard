@@ -1,6 +1,108 @@
+use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+use smoltcp::iface::SocketHandle;
+
+mod tcp;
+mod wg;
+
+use tcp::{ConnectionHandler, TcpConnection};
+
+#[derive(Debug)]
+struct EventAdapter {
+    send_queue: Arc<RwLock<VecDeque<(SocketHandle, Vec<u8>)>>>,
+    send_ready: Arc<RwLock<bool>>,
+    event_push: mpsc::Sender<Events>,
+    sock_count: Arc<RwLock<u32>>,
+    reuse_sock: Arc<RwLock<Vec<u32>>>,
+}
+
+impl EventAdapter {
+    fn new(event_push: mpsc::Sender<Events>) -> Self {
+        EventAdapter {
+            send_queue: Default::default(),
+            send_ready: Arc::new(RwLock::new(false)),
+            event_push,
+            sock_count: Default::default(),
+            reuse_sock: Default::default(),
+        }
+    }
+
+    fn send(&self, connection: SocketHandle, data: Vec<u8>) {
+        self.send_queue.write().unwrap().push_back((connection, data));
+        // FIXME: use a custom waker?
+        *self.send_ready.write().unwrap() = true;
+    }
+
+    async fn ready(&self) {
+        if *self.send_ready.read().unwrap() {
+            std::future::ready(()).await
+        } else {
+            // FIXME: use a custom waker?
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectionHandler for EventAdapter {
+    async fn handle(&self, connection: TcpConnection) {
+        let reader = connection.conn_forw_recv;
+        let writer = connection.conn_back_send;
+
+        let connection_id: u32 = {
+            if let Some(connection_id) = self.reuse_sock.write().unwrap().pop() {
+                connection_id
+            } else {
+                let mut sock_count = self.sock_count.write().unwrap();
+                *sock_count += 1;
+                *sock_count
+            }
+        };
+
+        self.event_push
+            .send(Events::ConnectionEstablished(ConnectionEstablished {
+                connection_id,
+                src_addr: todo!(),
+                dst_addr: todo!(),
+            }))
+            .await
+            .unwrap();
+
+        loop {
+            tokio::select!(
+                ret = reader.recv() => {
+                    if let Some(data) = ret {
+                        // pending data on the socket
+                        self.event_push.send(
+                            Events::DataReceived(DataReceived { connection_id, data })
+                        ).await.unwrap();
+                    } else {
+                        // connection was closed
+                        self.event_push.send(
+                            Events::ConnectionClosed(ConnectionClosed { connection_id })
+                        ).await.unwrap();
+
+                        self.reuse_sock.write().unwrap().push(connection_id);
+                        // FIXME: stop attempting to read after the connection was closed
+                    }
+                },
+                _ = self.ready() => {
+                    let mut queue = *self.send_queue.write().unwrap();
+
+                    while let Some((connection_id, data)) = queue.pop_front() {
+                        writer.send((connection_id, data)).await.unwrap();
+                    }
+                }
+            )
+        }
+    }
+}
+
+// =============================================================================
 
 use pyo3::prelude::*;
 use tokio::sync::mpsc;
@@ -53,7 +155,6 @@ impl ConnectionEstablished {
     }
 }
 
-
 #[pyclass]
 #[derive(Debug)]
 struct DataReceived {
@@ -69,7 +170,6 @@ impl DataReceived {
         format!("DataReceived({}, {:x?})", self.connection_id, self.data)
     }
 }
-
 
 #[pyclass]
 #[derive(Debug)]
@@ -106,7 +206,6 @@ impl DatagramReceived {
     }
 }
 
-
 #[derive(Debug)]
 enum Events {
     ConnectionEstablished(ConnectionEstablished),
@@ -125,7 +224,6 @@ impl IntoPy<PyObject> for Events {
         }
     }
 }
-
 
 #[pyclass]
 struct WireguardServer {
