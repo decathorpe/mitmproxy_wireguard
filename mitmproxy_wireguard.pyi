@@ -16,10 +16,10 @@ class ConnectionClosed:
     connection_id: int
 
 
-class DatagramReceived:
-    src_addr: tuple
-    dst_addr: tuple
-    data: bytes
+#class DatagramReceived:
+#    src_addr: tuple
+#    dst_addr: tuple
+#    data: bytes
 
 
 class ServerConnection:
@@ -27,9 +27,9 @@ class ServerConnection:
     def close(self, connection_id: int): ...
 
 
-async def start_server(
+def start_server(
     host: str,
     port: int,
-    on_event: Callable[ConnectionEstablished | DataReceived | ConnectionClosed | DatagramReceived]
+    on_event: Callable[ConnectionEstablished | DataReceived | ConnectionClosed ]
 ) -> ServerConnection:
     ...

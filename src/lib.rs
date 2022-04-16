@@ -324,6 +324,9 @@ fn start_server(py: Python<'_>, host: String, port: u16, event_handler: PyObject
 
 #[pymodule]
 fn mitmproxy_wireguard(_py: Python, m: &PyModule) -> PyResult<()> {
+    // set up the Rust logger to send messages to the Python logger
+    pyo3_log::init();
+
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_class::<ServerConnection>()?;
     m.add_class::<ConnectionEstablished>()?;
